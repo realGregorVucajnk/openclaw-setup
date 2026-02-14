@@ -1086,7 +1086,7 @@ If Tailscale goes down and you have no other access path, you're locked out. Thi
 
 ---
 
-## Appendix: Multi-Instance Scaling
+## Appendix A: Multi-Instance Scaling
 
 Each instance gets its own system user, service, port, and home directory:
 
@@ -1124,6 +1124,355 @@ sudo systemctl start ${NAME}.service
 
 ---
 
+## Appendix B: Externalize Secrets with 1Password Service Accounts
+
+> **Status:** Documented but not yet deployed. The environment variable override pattern described here uses OpenClaw's [documented env var support](https://docs.openclaw.ai/help/environment) and should work out of the box. However, this specific integration (1Password `op run` + systemd drop-in) has not been tested end-to-end on a live instance yet.
+
+### B.1 Overview
+
+By default, OpenClaw stores all secrets as plaintext on disk in `openclaw.json` and `~/.openclaw/credentials/`. This appendix describes how to move secrets into 1Password and fetch them at service startup, so that no long-lived secrets remain on the filesystem.
+
+**What changes:**
+- Gateway token, bot token, and LLM API key are stored in 1Password instead of on disk
+- The systemd unit uses `op run` to resolve secrets at startup
+- One bootstrap secret (the 1Password service account token) remains on disk, protected by file permissions
+
+**What stays the same:**
+- All deployment phases (1–10) are completed normally first
+- `openclaw.json` still exists (for non-secret configuration: channel policies, sandbox settings, tool deny lists, model selection, etc.)
+- SOUL.md, sandbox config, and all other hardening are unaffected
+
+> **Alternative approach (no 1Password):** If you just want secrets out of `openclaw.json` without 1Password, OpenClaw's existing `.env` file support works: move secrets to `~/.openclaw/.env` (already loaded by the systemd unit's `EnvironmentFile` directive) and remove them from `openclaw.json`. This appendix goes further by eliminating the `.env` file from disk too — secrets live only in 1Password and are resolved at startup.
+
+### B.2 Prerequisites
+
+- A [1Password account](https://1password.com/) (any tier — Individual, Teams, or Business)
+- The `op` CLI v2.x installed on the server:
+
+```bash
+# Install 1Password CLI (official method)
+curl -sS https://downloads.1password.com/linux/keys/1password.asc | \
+  sudo gpg --dearmor --output /usr/share/keyrings/1password-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/$(dpkg --print-architecture) stable main" | \
+  sudo tee /etc/apt/sources.list.d/1password.list
+sudo apt update && sudo apt install -y 1password-cli
+```
+
+Verify: `op --version` (must be 2.x)
+
+### B.3 Architecture: Vault-per-Agent
+
+Each OpenClaw instance gets its own 1Password vault, accessed by a dedicated service account with READ-only permissions. This isolates blast radius — a compromised service account token exposes only that agent's secrets.
+
+```
+┌─────────────────────────┐     ┌─────────────────────────┐
+│  1Password Vault:       │     │  1Password Vault:       │
+│  "OpenClaw-<agent-1>"   │     │  "OpenClaw-<agent-2>"   │
+│  ├── gateway-token      │     │  ├── gateway-token      │
+│  ├── bot-token          │     │  ├── bot-token          │
+│  └── llm-api-key        │     │  └── llm-api-key        │
+└──────────┬──────────────┘     └──────────┬──────────────┘
+           │ READ-only                      │ READ-only
+    ┌──────▼──────┐                  ┌──────▼──────┐
+    │  SA: agent1 │                  │  SA: agent2 │
+    └──────┬──────┘                  └──────┬──────┘
+           │                                │
+    ┌──────▼──────────┐              ┌──────▼──────────┐
+    │  Server 1       │              │  Server 2       │
+    │  openclaw.svc   │              │  openclaw.svc   │
+    └─────────────────┘              └─────────────────┘
+```
+
+**Scaling limits:** 1Password allows up to 100 service accounts per account. At one SA per agent, this supports 100 independent OpenClaw instances before needing to graduate to a different secrets manager (e.g., HashiCorp Vault).
+
+### B.4 Single-Agent Setup
+
+Complete all deployment phases (1–10) first. Secrets will exist on disk during initial setup — this is expected. You externalize them afterward.
+
+#### Step 1: Create a vault for this agent
+
+```bash
+op vault create "OpenClaw-<agent-name>"
+```
+
+#### Step 2: Store secrets in the vault
+
+Copy each secret from `openclaw.json` into 1Password. Replace `<agent-name>` with your vault name and `<value>` with the actual secret value:
+
+```bash
+# Gateway token (used for both auth.token and remote.token)
+op item create --vault "OpenClaw-<agent-name>" \
+  --category login \
+  --title "gateway" \
+  --generate-password='letters,digits,64' \
+  'token[password]=<your-gateway-token>'
+
+# Messaging bot token
+op item create --vault "OpenClaw-<agent-name>" \
+  --category login \
+  --title "bot" \
+  'token[password]=<your-bot-token>'
+
+# LLM API key
+op item create --vault "OpenClaw-<agent-name>" \
+  --category login \
+  --title "llm" \
+  'api-key[password]=<your-llm-api-key>'
+```
+
+#### Step 3: Create a service account
+
+In the [1Password web console](https://my.1password.com/) → Settings → Service Accounts:
+
+1. Create a new service account (e.g., `openclaw-<agent-name>`)
+2. Grant **READ-only** access to the `OpenClaw-<agent-name>` vault
+3. Save the service account token — this is the bootstrap secret
+
+> **Important:** Service account vault permissions are immutable after creation. If you need to change vault access, create a new service account.
+
+#### Step 4: Install the bootstrap token on the server
+
+The service account token is the one secret that must live on disk. Protect it with strict file permissions:
+
+```bash
+sudo mkdir -p /etc/openclaw
+sudo tee /etc/openclaw/bootstrap.env << 'EOF'
+OP_SERVICE_ACCOUNT_TOKEN=<your-service-account-token>
+EOF
+sudo chown root:root /etc/openclaw/bootstrap.env
+sudo chmod 0400 /etc/openclaw/bootstrap.env
+```
+
+Only `root` can read this file. systemd loads it via `EnvironmentFile` before dropping privileges to `openclaw-svc`.
+
+### B.5 systemd Integration — Approach A: `op run` with Environment Variables (Recommended)
+
+OpenClaw natively supports environment variable overrides for all secrets ([docs](https://docs.openclaw.ai/help/environment)). Environment variables take precedence over `openclaw.json` values. This approach uses `op run` to resolve `op://` references into env vars before spawning the gateway — secrets are never written to disk.
+
+**Key env vars and what they override:**
+
+| Environment Variable | Overrides in `openclaw.json` | Notes |
+|---------------------|------------------------------|-------|
+| `OPENCLAW_GATEWAY_TOKEN` | `gateway.auth.token` AND `gateway.remote.token` | Single var sets both — avoids the token mismatch gotcha |
+| `OPENAI_API_KEY` | OpenAI credentials | Standard provider env var |
+| `ANTHROPIC_API_KEY` | Anthropic credentials | Standard provider env var |
+| `GEMINI_API_KEY` | Google Gemini credentials | Standard provider env var |
+| `OPENROUTER_API_KEY` | OpenRouter credentials | Standard provider env var |
+| `TELEGRAM_BOT_TOKEN` | Telegram channel bot token | Standard provider env var |
+| `DISCORD_BOT_TOKEN` | Discord channel bot token | Standard provider env var |
+| `SLACK_BOT_TOKEN` | Slack channel bot token | Standard provider env var |
+
+> **Precedence:** CLI flags > process environment > `.env` files > `env` block in `openclaw.json` > config file values > defaults. Since systemd sets process environment before the gateway starts, env vars always win.
+
+Modify the systemd unit to use `op run` as a wrapper. Adapt the env var list below to match your LLM provider and messaging channel:
+
+```bash
+sudo mkdir -p /etc/systemd/system/openclaw.service.d
+
+sudo tee /etc/systemd/system/openclaw.service.d/1password.conf << 'EOF'
+[Service]
+# Load the 1Password service account token (bootstrap secret)
+EnvironmentFile=/etc/openclaw/bootstrap.env
+
+# Gateway token — OPENCLAW_GATEWAY_TOKEN sets both auth.token and remote.token
+Environment="OPENCLAW_GATEWAY_TOKEN=op://OpenClaw-<agent-name>/gateway/token"
+
+# LLM API key — use the env var for your provider (uncomment one):
+# Environment="OPENAI_API_KEY=op://OpenClaw-<agent-name>/llm/api-key"
+# Environment="ANTHROPIC_API_KEY=op://OpenClaw-<agent-name>/llm/api-key"
+# Environment="GEMINI_API_KEY=op://OpenClaw-<agent-name>/llm/api-key"
+
+# Messaging bot token — use the env var for your channel (uncomment one):
+# Environment="TELEGRAM_BOT_TOKEN=op://OpenClaw-<agent-name>/bot/token"
+# Environment="DISCORD_BOT_TOKEN=op://OpenClaw-<agent-name>/bot/token"
+# Environment="SLACK_BOT_TOKEN=op://OpenClaw-<agent-name>/bot/token"
+
+# Override ExecStart to wrap with op run
+ExecStart=
+ExecStart=/usr/local/bin/op run --no-masking -- /home/openclaw-svc/.npm-global/bin/openclaw gateway run
+EOF
+
+sudo systemctl daemon-reload
+```
+
+**Key details:**
+- The drop-in override (`1password.conf`) keeps the base service file untouched
+- `ExecStart=` (empty) clears the previous ExecStart before setting the new one
+- `--no-masking` prevents `op run` from redacting secrets in log output (systemd already handles log access controls; masking would break token passing)
+- `op run` spawns `openclaw gateway run` as a child process — do NOT set `KillMode=process` or systemd won't clean up the child on stop
+- `OPENCLAW_GATEWAY_TOKEN` sets both `gateway.auth.token` and `gateway.remote.token` simultaneously, eliminating the token mismatch gotcha from the main deployment guide
+
+### B.6 systemd Integration — Approach B: `op inject` Config Templating (Fallback)
+
+Use this approach if you need secrets injected into `openclaw.json` directly — for example, if a future OpenClaw feature requires secrets in the config file that have no env var equivalent, or if you prefer a single-file configuration model. For most deployments, Approach A is simpler and more secure.
+
+#### Step 1: Create a config template
+
+After completing the standard deployment, create a template from the live config:
+
+```bash
+sudo -u openclaw-svc bash -c '
+  cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.bak
+'
+```
+
+Create `openclaw.json.tpl` by replacing secret values with `op://` references. The exact JSON paths depend on your `openclaw.json` structure — the template should look like:
+
+```json
+{
+  "gateway": {
+    "auth": {
+      "token": "op://OpenClaw-<agent-name>/gateway/token"
+    },
+    "remote": {
+      "token": "op://OpenClaw-<agent-name>/gateway/token"
+    }
+  }
+}
+```
+
+> **Note:** Only replace secret fields with `op://` references. Keep all non-secret configuration values as-is. The actual JSON structure depends on your OpenClaw version — use your existing `openclaw.json` as the starting point.
+
+Store the template as root-owned:
+
+```bash
+sudo mv /home/openclaw-svc/.openclaw/openclaw.json.tpl /etc/openclaw/openclaw.json.tpl
+sudo chown root:root /etc/openclaw/openclaw.json.tpl
+sudo chmod 0444 /etc/openclaw/openclaw.json.tpl
+```
+
+#### Step 2: Create a wrapper script
+
+```bash
+sudo tee /usr/local/bin/openclaw-inject-secrets << 'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+/usr/local/bin/op inject -i /etc/openclaw/openclaw.json.tpl \
+  -o /home/openclaw-svc/.openclaw/openclaw.json
+chown openclaw-svc:openclaw-svc /home/openclaw-svc/.openclaw/openclaw.json
+chmod 600 /home/openclaw-svc/.openclaw/openclaw.json
+SCRIPT
+sudo chmod 0755 /usr/local/bin/openclaw-inject-secrets
+```
+
+#### Step 3: Add an ExecStartPre to the systemd unit
+
+```bash
+sudo tee /etc/systemd/system/openclaw.service.d/1password.conf << 'EOF'
+[Service]
+EnvironmentFile=/etc/openclaw/bootstrap.env
+ExecStartPre=/usr/local/bin/openclaw-inject-secrets
+EOF
+
+sudo systemctl daemon-reload
+```
+
+**Trade-off:** This approach briefly writes plaintext secrets to `openclaw.json` on each service start. The file is on a real filesystem (not tmpfs), but it's protected by 600 permissions and only readable by `openclaw-svc`. This is less secure than Approach A but works regardless of OpenClaw's env var support.
+
+### B.7 Test
+
+After applying either approach:
+
+```bash
+# Restart the service
+sudo systemctl restart openclaw.service
+
+# Verify it started successfully
+sudo systemctl status openclaw.service
+
+# Check logs for secret resolution errors
+sudo journalctl -u openclaw.service --since "30 sec ago" --no-pager
+
+# Run diagnostics
+sudo -u openclaw-svc bash -c '
+  cd ~ && export PATH=$HOME/.npm-global/bin:$PATH
+  openclaw doctor
+'
+
+# Verify gateway responds
+sudo -u openclaw-svc bash -c '
+  cd ~ && export PATH=$HOME/.npm-global/bin:$PATH
+  openclaw security audit --deep
+'
+```
+
+If the service fails to start, check:
+- `op` CLI is installed and accessible: `which op`
+- Bootstrap token is valid: `sudo cat /etc/openclaw/bootstrap.env | head -c 20` (check it's not empty)
+- Vault and item names match the `op://` references exactly
+- 1Password API is reachable: `op vault list` (with OP_SERVICE_ACCOUNT_TOKEN set)
+
+### B.8 Scrub Disk Secrets
+
+After verifying the service works with 1Password, remove plaintext secrets from `openclaw.json`:
+
+> **Only do this if using Approach A (env var overrides).** If using Approach B, `openclaw.json` is regenerated on each start from the template — scrubbing is not applicable.
+
+```bash
+sudo -u openclaw-svc bash -c '
+  cd ~ && export PATH=$HOME/.npm-global/bin:$PATH
+  openclaw config set gateway.auth.token "MANAGED_BY_1PASSWORD"
+  openclaw config set gateway.remote.token "MANAGED_BY_1PASSWORD"
+'
+```
+
+For bot tokens and LLM API keys, remove or replace the secret values in `openclaw.json` and the `env` block. Channel policy settings (`dmPolicy`, `groupPolicy`, `configWrites`) have no env var equivalent and must remain in `openclaw.json` — only scrub the actual secret fields.
+
+Verify the service still works after scrubbing:
+
+```bash
+sudo systemctl restart openclaw.service
+sudo systemctl status openclaw.service
+```
+
+### B.9 Secret Rotation Workflow
+
+With 1Password, rotation becomes:
+
+1. Update the secret in 1Password (web UI or `op item edit`)
+2. Restart the service: `sudo systemctl restart openclaw.service`
+3. Verify: `sudo systemctl status openclaw.service`
+
+No manual config file editing required. The `op run` or `op inject` step fetches the latest value on each restart.
+
+### B.10 Failure Modes
+
+| Failure | Symptom | Recovery |
+|---------|---------|----------|
+| 1Password API unreachable | Service fails to start; `op run` exits with connection error | Wait and retry (`Restart=on-failure` handles this). If prolonged, restore secrets to disk temporarily. |
+| Bootstrap token revoked | Service fails to start; `op run` exits with auth error | Generate new SA token in 1Password console, update `/etc/openclaw/bootstrap.env`, restart. |
+| Bootstrap token file deleted | Service fails to start; `EnvironmentFile` missing | Recreate `/etc/openclaw/bootstrap.env` from 1Password console. |
+| Vault/item renamed | Service fails to start; `op://` reference not found | Update `op://` references in systemd unit or template to match new names. |
+| Rate limiting (unlikely) | Intermittent failures | 1Password allows 1,000 reads/hr (Teams) or 10,000/hr (Business). At 5-10 reads per restart, this is not a practical concern. |
+
+### B.11 The Bootstrap Secret — Honest Assessment
+
+**You always need one secret on disk.** The 1Password service account token (`OP_SERVICE_ACCOUNT_TOKEN`) must be stored somewhere the service can read it at startup. This appendix reduces the disk secret surface from ~4 secrets (gateway token, bot token, LLM key, potentially more) to exactly 1 (the SA token).
+
+**Protection layers for the bootstrap token:**
+- File permissions: `root:root 0400` — only root can read
+- systemd loads it via `EnvironmentFile` before dropping to `openclaw-svc`
+- The `openclaw-svc` user cannot read the file directly
+- If the server has a TPM, `systemd-creds encrypt` can bind the token to the machine (requires systemd 250+, which Ubuntu 25.10 has) — see systemd-creds(1) for details
+
+**If the bootstrap token is compromised:** the attacker gains READ-only access to one vault (this agent's secrets only). They cannot modify secrets, access other vaults, or pivot to other agents. Rotate the SA token immediately in the 1Password console.
+
+### B.12 Multi-Agent Scaling
+
+For multiple OpenClaw instances (see Appendix A):
+
+| Instance | Vault | Service Account | Bootstrap File |
+|----------|-------|----------------|----------------|
+| openclaw-svc | `OpenClaw-agent1` | `openclaw-agent1` | `/etc/openclaw/agent1-bootstrap.env` |
+| openclaw-agent2 | `OpenClaw-agent2` | `openclaw-agent2` | `/etc/openclaw/agent2-bootstrap.env` |
+| openclaw-agent3 | `OpenClaw-agent3` | `openclaw-agent3` | `/etc/openclaw/agent3-bootstrap.env` |
+
+Each instance gets its own systemd drop-in override pointing to its bootstrap file and vault. No vault sharing between agents.
+
+**When to graduate beyond 1Password:** If you exceed 100 agents, need dynamic secret generation, or require lease-based rotation, consider HashiCorp Vault or a cloud-native secrets manager (AWS Secrets Manager, GCP Secret Manager).
+
+---
+
 ## Verification Checklist
 
 | Check | Command | Expected |
@@ -1158,6 +1507,9 @@ sudo systemctl start ${NAME}.service
 | `/etc/cron.weekly/openclaw-soul-check` | Weekly integrity check cron |
 | `/etc/apt/sources.list.d/nodesource.list` | NodeSource repo |
 | `/etc/apt/sources.list.d/docker.list` | Docker repo |
+| `/etc/openclaw/bootstrap.env` | 1Password SA token (if using Appendix B) |
+| `/etc/openclaw/openclaw.json.tpl` | Config template for `op inject` (Appendix B, Approach B) |
+| `/etc/systemd/system/openclaw.service.d/1password.conf` | systemd drop-in for 1Password (Appendix B) |
 
 ---
 
@@ -1202,6 +1554,7 @@ sudo journalctl -u openclaw.service -f   # Follow logs
 - [ ] Verify sandbox Docker image build (`openclaw-sandbox:bookworm-slim`)
 - [ ] PATH wrapper script (`/usr/local/bin/oc`)
 - [ ] NOPASSWD sudoers cleanup
+- [ ] Test 1Password `op run` integration end-to-end on live instance (Appendix B)
 
 ---
 

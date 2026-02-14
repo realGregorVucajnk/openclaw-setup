@@ -585,12 +585,26 @@ Long-polling is the correct choice here because:
 | 6  | OS hardening             | Unattended upgrades, fail2ban, sudo-rs           |
 | 7  | Process isolation        | systemd hardening (17 active directives)         |
 | 8  | Least privilege          | Locked user, no sudo, docker group only          |
-| 9  | Gateway authentication   | Token-based auth for API access                  |
-| 10 | Channel policy           | Messaging pairing mode, no groups, no config DMs |
-| 11 | Agent boundaries         | SOUL.md with hardcoded security rules            |
-| 12 | Sandbox isolation        | Docker: network=none, readOnlyRoot, ephemeral    |
+| 9  | Secrets management (opt) | 1Password service accounts, vault-per-agent (see deployment guide Appendix B) |
+| 10 | Gateway authentication   | Token-based auth for API access                  |
+| 11 | Channel policy           | Messaging pairing mode, no groups, no config DMs |
+| 12 | Agent boundaries         | SOUL.md with hardcoded security rules            |
+| 13 | Sandbox isolation        | Docker: network=none, readOnlyRoot, ephemeral    |
 
-### 7.3 SOUL.md Integrity Chain
+### 7.3 Optional: Secrets Externalization (1Password)
+
+Secrets can optionally be moved from plaintext files on disk into 1Password
+service accounts. Each agent gets its own vault with a dedicated READ-only
+service account, limiting blast radius to a single agent if a token is
+compromised. The systemd unit uses `op run` to resolve secrets at startup —
+only one bootstrap secret (the service account token) remains on disk.
+
+This is an **optional** enhancement. The default deployment stores
+secrets in `openclaw.json` with 600 permissions, which is sufficient for
+single-operator deployments. See `openclaw-deployment-guide.md` Appendix B
+for the full setup procedure.
+
+### 7.4 SOUL.md Integrity Chain
 
 ```
   Deployment
@@ -615,7 +629,7 @@ read-only). If an attacker gains code execution as the service user, they
 cannot alter the agent's security boundaries. Any unauthorized change is
 detected within 7 days by the weekly cron check.
 
-### 7.4 Messaging Channel Security Posture
+### 7.5 Messaging Channel Security Posture
 
 The messaging channel integration has minimal attack surface:
 
@@ -625,7 +639,7 @@ The messaging channel integration has minimal attack surface:
 - **No config writes:** messages cannot change gateway configuration
 - **Privacy mode:** if your messaging platform supports it, enable privacy mode to ignore group messages
 
-### 7.5 Tailscale ACL Requirements
+### 7.6 Tailscale ACL Requirements
 
 Tailscale ACLs control which devices on your tailnet can reach the server. The default "allow all" policy is too permissive for a production deployment.
 
@@ -637,7 +651,7 @@ Tailscale ACLs control which devices on your tailnet can reach the server. The d
 
 See [`SECURITY.md`](SECURITY.md) §4 for a recommended ACL template and Funnel verification procedures.
 
-### 7.6 Backup & Disaster Recovery
+### 7.7 Backup & Disaster Recovery
 
 The deployment produces several stateful artifacts that must be backed up for recovery:
 - **Secrets** (gateway token, API credentials) — encrypted backup required
@@ -739,6 +753,14 @@ sudo -u openclaw-svc bash -c '
 | `/var/lib/openclaw-soul-baseline.sha256`                | root               | 644  | SOUL.md integrity baseline   |
 | `/etc/cron.weekly/openclaw-security-audit`              | root               | 755  | Weekly security audit script |
 | `/etc/cron.weekly/openclaw-soul-check`                  | root               | 755  | Weekly SOUL.md integrity check|
+
+**Optional (if using 1Password — see deployment guide Appendix B):**
+
+| Path (on server)                                        | Owner              | Mode | Purpose                      |
+|---------------------------------------------------------|--------------------|------|------------------------------|
+| `/etc/openclaw/bootstrap.env`                           | root               | 400  | 1Password service account token |
+| `/etc/openclaw/openclaw.json.tpl`                       | root               | 444  | Config template for `op inject` |
+| `/etc/systemd/system/openclaw.service.d/1password.conf` | root               | 644  | systemd drop-in override     |
 
 ## Appendix B: Deployment Gotchas
 

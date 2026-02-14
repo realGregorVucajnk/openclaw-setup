@@ -271,6 +271,7 @@ sudo docker ps -a | grep openclaw
 | **LLM API key** | Revoke in your LLM provider's console. Generate new key. Update credentials. Restart service. |
 | **LLM OAuth** | Revoke sessions in your LLM provider's console. Re-authenticate: `openclaw models auth login`. |
 | **Tailscale** | Remove the compromised node from your tailnet. Re-join with a fresh auth key. Review ACLs. |
+| **1Password SA token** (if using Appendix B) | Revoke the service account in 1Password console. Create a new SA with the same vault permissions. Update `/etc/openclaw/bootstrap.env` with the new token. Restart service. |
 
 ### Post-Rotation
 
@@ -336,7 +337,36 @@ Incident detected
 
 ---
 
-## 8. Security Review Schedule
+## 8. 1Password Verification (If Using Appendix B)
+
+These checks apply only if you've externalized secrets to 1Password per `openclaw-deployment-guide.md` Appendix B.
+
+### Bootstrap Token Protection
+
+- [ ] Bootstrap token file exists: `ls -la /etc/openclaw/bootstrap.env`
+- [ ] Permissions are `root:root 0400`: `stat -c '%U:%G %a' /etc/openclaw/bootstrap.env`
+- [ ] File is not world-readable: permissions must be `400`, not `444` or `644`
+- [ ] The `openclaw-svc` user cannot read it directly: `sudo -u openclaw-svc cat /etc/openclaw/bootstrap.env` (must fail with "Permission denied")
+
+### Service Account Permissions
+
+- [ ] Service account has READ-only access to exactly one vault (the agent's vault)
+- [ ] Service account cannot access other vaults: `sudo bash -c 'source /etc/openclaw/bootstrap.env && op vault list'` (must show only the agent's vault)
+
+### Secret Resolution
+
+- [ ] Service starts successfully with `op run`: `sudo systemctl status openclaw.service`
+- [ ] No plaintext secrets in `openclaw.json` (if using Approach A): `sudo grep -c 'MANAGED_BY_1PASSWORD' /home/openclaw-svc/.openclaw/openclaw.json`
+- [ ] systemd drop-in is loaded: `sudo systemctl cat openclaw.service` (should show `1password.conf` contents)
+
+### Failure Recovery
+
+- [ ] Documented procedure for restoring secrets to disk if 1Password is unreachable
+- [ ] Bootstrap token is included in encrypted backup procedure (§5)
+
+---
+
+## 9. Security Review Schedule
 
 | Frequency | Action |
 |-----------|--------|

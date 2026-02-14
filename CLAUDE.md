@@ -61,6 +61,12 @@ sudo sha256sum -c /var/lib/openclaw-soul-baseline.sha256
 # Session verification (run before any firewall changes)
 who -m                    # Verify connection is from Tailscale IP (100.x.y.z)
 ss -tnp | grep ssh        # Should return empty if using Tailscale SSH
+
+# 1Password secret resolution (if using Appendix B of deployment guide)
+# Verify op CLI works with the service account
+sudo bash -c 'source /etc/openclaw/bootstrap.env && op vault list'
+# Check systemd drop-in is loaded
+sudo systemctl cat openclaw.service | grep 1password
 ```
 
 ## Critical Gotchas
@@ -79,6 +85,9 @@ These were discovered during deployment and will silently break the service if v
 - **NodeSource removes UFW**: Removing Ubuntu's `nodejs` package to install NodeSource Node 22 also removes `ufw`. Always reinstall UFW after the Node.js swap.
 - **sudo-rs**: Ubuntu 25.10 uses `sudo-rs` (Rust reimplementation) by default. Some sudo flags behave differently.
 - **`controlUi.allowInsecureAuth` must be `false`**: If the control UI is enabled, `gateway.controlUi.allowInsecureAuth` must be `false`. When `true`, token-only HTTP auth is allowed — anyone who intercepts the token gets full gateway control, including host-level command execution via `tools.elevated`. This is the most common CRITICAL finding in `openclaw security audit --deep`.
+- **`op run` KillMode**: If using 1Password `op run` wrapper (Appendix B), do NOT set `KillMode=process` — `op run` spawns a child process, and systemd needs `control-group` (default) to clean up both processes on stop.
+- **1Password API dependency**: `op run` fails if 1Password API is unreachable — the service won't start. `Restart=on-failure` handles transient outages, but prolonged 1Password downtime requires restoring secrets to disk temporarily.
+- **`OPENCLAW_GATEWAY_TOKEN` sets both tokens**: When using env vars for the gateway token, `OPENCLAW_GATEWAY_TOKEN` sets both `auth.token` and `remote.token` simultaneously — no need to set them separately, and the mismatch gotcha is eliminated.
 
 ## Admin Access
 
